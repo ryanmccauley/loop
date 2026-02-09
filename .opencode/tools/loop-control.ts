@@ -2,10 +2,12 @@ import { tool } from "@opencode-ai/plugin/tool"
 
 export default tool({
   description:
-    "Signal your current status to the loop orchestrator. " +
-    "Call this tool when you have completed all work, when you are blocked and cannot proceed, " +
-    "or to report progress at natural checkpoints. " +
-    "You MUST call this with status 'complete' when you have finished all tasks.",
+    "MANDATORY: Signal your current status to the loop orchestrator. " +
+    "You MUST call this tool as the LAST action of EVERY turn — it is the ONLY way to properly end your turn. " +
+    "If you do not call this tool, the orchestrator will re-prompt you, wasting time and resources. " +
+    "Use 'complete' when ALL tasks are finished, 'blocked' when you cannot proceed, " +
+    "or 'progress' ONLY when there is clearly more work remaining. " +
+    "Do NOT use 'progress' if all work is done — use 'complete' instead.",
   args: {
     status: tool.schema.enum(["complete", "blocked", "progress"]).describe(
       "'complete' = all tasks finished successfully, " +

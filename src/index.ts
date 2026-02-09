@@ -2,13 +2,14 @@ import { createOpencode, createOpencodeClient, type OpencodeClient } from "@open
 import { cpSync, existsSync, rmSync } from "fs"
 import { join, resolve, dirname } from "path"
 import { parseConfig, type Config } from "./config.js"
-import { log } from "./log.js"
 import {
   subscribeToEvents,
   getLatestAssistantParts,
   extractLoopControl,
-  type LoopControlResult,
 } from "./events.js"
+import type { LoopUI, IterationSummary } from "./ui.js"
+import { LogUI } from "./log-ui.js"
+import { TuiUI } from "./tui.js"
 
 // ─── .opencode file installation ──────────────────────────────────────
 
@@ -24,7 +25,7 @@ function getSourceOpencodeDir(): string {
  * Copy our .opencode agent/plugin/tool files into the target project.
  * Overwrites existing files with a warning.
  */
-function installOpencodeFiles(targetCwd: string) {
+function installOpencodeFiles(targetCwd: string, ui: LoopUI) {
   const sourceDir = getSourceOpencodeDir()
   const targetDir = join(targetCwd, ".opencode")
 
@@ -33,18 +34,18 @@ function installOpencodeFiles(targetCwd: string) {
     const dest = join(targetDir, file)
 
     if (!existsSync(src)) {
-      log.warn(`Source file not found: ${src}`)
+      ui.onWarn(`Source file not found: ${src}`)
       continue
     }
 
     if (existsSync(dest)) {
-      log.info(`Overwriting ${file} in target .opencode/`)
+      ui.onInfo(`Overwriting ${file} in target .opencode/`)
     }
 
     cpSync(src, dest, { recursive: true })
   }
 
-  log.success("Installed loop agent, plugin, and tool into target project")
+  ui.onSuccess("Installed loop agent, plugin, and tool into target project")
 }
 
 /**
@@ -59,53 +60,35 @@ function cleanupOpencodeFiles(targetCwd: string) {
       rmSync(dest)
     }
   }
-
-  // Clean up empty directories
-  for (const dir of ["agents", "plugins", "tools"]) {
-    const dirPath = join(targetDir, dir)
-    try {
-      const entries = Bun.file(dirPath)
-      // rmSync only if directory is empty - use readdir check
-    } catch {
-      // ignore
-    }
-  }
 }
 
 // ─── Orchestrator ─────────────────────────────────────────────────────
 
-interface IterationSummary {
-  iteration: number
-  status: LoopControlResult | null
-  cost: number
-  tokens: { input: number; output: number }
-  duration: number
-}
-
 async function run() {
   const config = parseConfig(process.argv)
 
-  log.banner("opencode-loop")
-  log.info(`Prompt: ${config.prompt.slice(0, 100)}${config.prompt.length > 100 ? "..." : ""}`)
-  log.info(`Target: ${config.cwd}`)
-  log.info(`Max iterations: ${config.maxIterations}`)
-  if (config.model) log.info(`Model: ${config.model.providerID}/${config.model.modelID}`)
-  log.info(`Agent: ${config.agent}`)
-  log.separator()
+  // Create UI
+  const ui: LoopUI = config.noTui ? new LogUI() : await TuiUI.create()
+
+  const modelLabel = config.model
+    ? `${config.model.providerID}/${config.model.modelID}`
+    : undefined
 
   // Install .opencode files into target project
-  installOpencodeFiles(config.cwd)
+  installOpencodeFiles(config.cwd, ui)
 
   let client: OpencodeClient
   let serverClose: (() => void) | undefined
+  let serverUrl: string | undefined
 
   try {
     // Connect or start server
     if (config.attach) {
-      log.info(`Attaching to existing server at ${config.attach}`)
+      ui.onInfo(`Attaching to existing server at ${config.attach}`)
       client = createOpencodeClient({ baseUrl: config.attach })
+      serverUrl = config.attach
     } else {
-      log.info("Starting opencode server...")
+      ui.onInfo("Starting opencode server...")
       // Change to target directory so opencode serves the correct project
       process.chdir(config.cwd)
       const result = await createOpencode({
@@ -113,48 +96,54 @@ async function run() {
       })
       client = result.client
       serverClose = result.server.close
-      log.success(`Server started at ${result.server.url}`)
-      log.info(`Attach a TUI with: opencode attach --url ${result.server.url}`)
+      serverUrl = result.server.url
+      ui.onSuccess(`Server started at ${result.server.url}`)
     }
 
+    // Now that we have serverUrl, call onStart
+    ui.onStart(config.prompt, config.cwd, config.maxIterations, modelLabel, serverUrl)
+
     // Create session
-    log.info("Creating session...")
+    ui.onInfo("Creating session...")
     const sessionResult = await client.session.create()
     if (sessionResult.error || !sessionResult.data) {
-      log.error(`Failed to create session: ${JSON.stringify(sessionResult.error)}`)
+      ui.onError(`Failed to create session: ${JSON.stringify(sessionResult.error)}`)
       process.exit(1)
     }
     const sessionID = sessionResult.data.id
-    log.success(`Session created: ${sessionID}`)
+    ui.onSuccess(`Session created: ${sessionID}`)
 
     // Run the loop
-    await loopMain(client, sessionID, config)
+    await loopMain(client, sessionID, config, ui)
   } finally {
     cleanupOpencodeFiles(config.cwd)
     if (serverClose) {
-      log.info("Shutting down server...")
+      ui.onInfo("Shutting down server...")
       serverClose()
     }
+    ui.destroy()
   }
 }
 
-async function loopMain(client: OpencodeClient, sessionID: string, config: Config) {
+async function loopMain(client: OpencodeClient, sessionID: string, config: Config, ui: LoopUI) {
   const summaries: IterationSummary[] = []
   let totalCost = 0
   let currentIteration = 0
+  let consecutiveMisses = 0 // Track consecutive turns without loop_control call
 
   // Set up signal handlers
   let aborted = false
   const onSignal = async () => {
     if (aborted) process.exit(1) // Force exit on second signal
     aborted = true
-    log.warn("Received interrupt signal, aborting current session...")
+    ui.onWarn("Received interrupt signal, aborting current session...")
     try {
       await client.session.abort({ path: { id: sessionID } })
     } catch {
       // ignore
     }
-    printSummary(summaries, totalCost)
+    ui.onLoopComplete(summaries, totalCost)
+    ui.destroy()
     process.exit(130)
   }
   process.on("SIGINT", onSignal)
@@ -174,28 +163,31 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
       }
     },
     onError: (_sid, error) => {
-      if (eventState.errorResolve) {
+      // If this is a real session error, dispatch to the error resolver
+      if (_sid && eventState.errorResolve) {
         eventState.errorResolve(error)
         eventState.errorResolve = null
+      } else {
+        // Event stream infrastructure error
+        ui.onError(String(error))
       }
     },
     onToolUpdate: (tool, status, title) => {
-      log.tool(tool, title ?? status)
+      ui.onToolUpdate(tool, status, title)
     },
     onTextDelta: () => {
-      // For future TUI streaming; no-op for now
+      // For future streaming; no-op for now
     },
     onStatus: (_sid, status) => {
-      log.status(`Session status: ${status}`)
+      ui.onStatusChange(status)
     },
   })
 
   try {
     // Send initial prompt
     currentIteration = 1
-    log.setIteration(currentIteration, config.maxIterations)
-    log.separator()
-    log.info("Sending initial prompt...")
+    ui.onIterationStart(currentIteration, config.maxIterations)
+    ui.onInfo("Sending initial prompt...")
 
     await sendPrompt(client, sessionID, config, config.prompt)
 
@@ -204,15 +196,15 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
       const iterStart = Date.now()
 
       // Wait for session to go idle or error
-      const result = await waitForIdleOrError(eventState, config.maxRetries, async (retryNum) => {
-        log.warn(`Retrying prompt (attempt ${retryNum + 1}/${config.maxRetries})...`)
+      const result = await waitForIdleOrError(eventState, config.maxRetries, ui, async (retryNum) => {
+        ui.onWarn(`Retrying prompt (attempt ${retryNum + 1}/${config.maxRetries})...`)
         const delay = [0, 5000, 15000][retryNum] ?? 15000
         if (delay > 0) await sleep(delay)
         await sendPrompt(client, sessionID, config, "Continue working on the task. Pick up where you left off.")
       })
 
       if (result === "error") {
-        log.error("Max retries exceeded. Stopping loop.")
+        ui.onError("Max retries exceeded. Stopping loop.")
         break
       }
 
@@ -231,47 +223,76 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
       summaries.push(summary)
       totalCost += summary.cost
 
-      // Log iteration result
+      // Notify UI
+      ui.onIterationComplete(summary)
+
+      // Determine if we should stop
       if (loopResult) {
-        const statusLabel = loopResult.status.toUpperCase()
-        if (loopResult.status === "complete") {
-          log.success(`Agent signaled COMPLETE: ${loopResult.message}`)
+        consecutiveMisses = 0
+        if (loopResult.status === "complete" || loopResult.status === "blocked") {
           break
-        } else if (loopResult.status === "blocked") {
-          log.error(`Agent signaled BLOCKED: ${loopResult.message}`)
-          break
-        } else if (loopResult.status === "progress") {
-          log.info(`Agent signaled PROGRESS: ${loopResult.message}`)
-        } else {
-          log.warn(`Agent signaled ${statusLabel}: ${loopResult.message}`)
         }
       } else {
-        log.warn("Agent did not call loop_control. Re-prompting to continue...")
+        consecutiveMisses++
+        ui.onWarn(`Agent did not call loop_control (miss #${consecutiveMisses}). Re-prompting to continue...`)
       }
 
       // Check if we've hit max iterations
       currentIteration++
       if (currentIteration > config.maxIterations) {
-        log.warn(`Reached max iterations (${config.maxIterations}). Stopping loop.`)
+        ui.onWarn(`Reached max iterations (${config.maxIterations}). Stopping loop.`)
         break
       }
 
-      log.setIteration(currentIteration, config.maxIterations)
-      log.separator()
+      // If paused (TUI feature), wait for unpause
+      if (ui.isPaused()) {
+        ui.onInfo("Loop paused. Press 'p' to resume...")
+        if (ui instanceof TuiUI) {
+          await ui.waitForUnpause()
+        }
+      }
 
-      // Re-prompt
-      const continueMsg = loopResult
-        ? "Continue working on the task. You previously reported progress. Pick up where you left off."
-        : "Continue working on the task. Remember to call the loop_control tool when you reach a stopping point — use 'complete' when all work is done, 'progress' to report a checkpoint, or 'blocked' if you're stuck."
+      ui.onIterationStart(currentIteration, config.maxIterations)
 
-      log.info("Re-prompting agent...")
+      // Re-prompt with escalating urgency based on consecutive misses
+      let continueMsg: string
+      if (loopResult) {
+        // Agent called loop_control with "progress" — nudge toward completion
+        continueMsg =
+          "Continue working on the task. You previously reported progress. Pick up where you left off. " +
+          "When you are done with all remaining work, you MUST call `loop_control` with status 'complete'. " +
+          "Do NOT use 'progress' if there is nothing left to do."
+      } else if (consecutiveMisses === 1) {
+        continueMsg =
+          "You did not call the `loop_control` tool on your last turn. " +
+          "You MUST call `loop_control` at the end of every turn — it is the only way to signal the orchestrator. " +
+          "If all work is done, call `loop_control` with status 'complete'. " +
+          "If there's more to do, call it with 'progress'. " +
+          "If you're stuck, call it with 'blocked'. " +
+          "Continue working, and make sure to call `loop_control` before your turn ends."
+      } else if (consecutiveMisses === 2) {
+        continueMsg =
+          "IMPORTANT: You have failed to call `loop_control` for 2 consecutive turns. " +
+          "This is wasting loop iterations. You MUST call the `loop_control` tool RIGHT NOW. " +
+          "If your work is complete, call `loop_control` with status 'complete' and a brief summary. " +
+          "If you still have work to do, call `loop_control` with status 'progress'. " +
+          "Do not perform any other actions — just call `loop_control` immediately."
+      } else {
+        continueMsg =
+          "CRITICAL: You have NOT called `loop_control` for " + consecutiveMisses + " consecutive turns. " +
+          "STOP all other work. Your ONLY task right now is to call the `loop_control` tool. " +
+          "Call `loop_control` with status 'complete' if work is done, 'progress' if not, or 'blocked' if stuck. " +
+          "Do NOT do anything else. Just call `loop_control`."
+      }
+
+      ui.onInfo("Re-prompting agent...")
       await sendPrompt(client, sessionID, config, continueMsg)
     }
   } finally {
     eventSub.abort()
   }
 
-  printSummary(summaries, totalCost)
+  ui.onLoopComplete(summaries, totalCost)
 }
 
 async function sendPrompt(
@@ -310,6 +331,7 @@ async function waitForIdleOrError(
     errorResolve: ((value: any) => void) | null
   },
   maxRetries: number,
+  ui: LoopUI,
   onRetry: (retryNum: number) => Promise<void>
 ): Promise<"idle" | "error"> {
   let retries = 0
@@ -323,49 +345,11 @@ async function waitForIdleOrError(
     if (result === "idle") return "idle"
 
     // Error occurred
-    log.error(`Session error: ${JSON.stringify(result.error)}`)
+    ui.onError(`Session error: ${JSON.stringify(result.error)}`)
     retries++
     if (retries >= maxRetries) return "error"
 
     await onRetry(retries - 1)
-  }
-}
-
-function printSummary(summaries: IterationSummary[], totalCost: number) {
-  log.separator()
-  log.banner("Loop Summary")
-
-  if (summaries.length === 0) {
-    log.info("No iterations completed.")
-    return
-  }
-
-  for (const s of summaries) {
-    const status = s.status
-      ? `${s.status.status.toUpperCase()}: ${s.status.message}`
-      : "no loop_control call"
-    const duration = (s.duration / 1000).toFixed(1)
-    const cost = s.cost.toFixed(4)
-    log.info(`  Iteration ${s.iteration}: ${status} (${duration}s, $${cost})`)
-  }
-
-  const totalDuration = summaries.reduce((a, s) => a + s.duration, 0)
-  const totalTokensIn = summaries.reduce((a, s) => a + s.tokens.input, 0)
-  const totalTokensOut = summaries.reduce((a, s) => a + s.tokens.output, 0)
-
-  log.separator()
-  log.info(`Total iterations: ${summaries.length}`)
-  log.info(`Total time: ${(totalDuration / 1000).toFixed(1)}s`)
-  log.info(`Total cost: $${totalCost.toFixed(4)}`)
-  log.info(`Total tokens: ${totalTokensIn.toLocaleString()} in / ${totalTokensOut.toLocaleString()} out`)
-
-  const lastStatus = summaries[summaries.length - 1]?.status
-  if (lastStatus?.status === "complete") {
-    log.success("Result: COMPLETE")
-  } else if (lastStatus?.status === "blocked") {
-    log.error("Result: BLOCKED")
-  } else {
-    log.warn("Result: INCOMPLETE (max iterations or interrupted)")
   }
 }
 
@@ -376,7 +360,7 @@ function sleep(ms: number): Promise<void> {
 // ─── Entry point ──────────────────────────────────────────────────────
 
 run().catch((err) => {
-  log.error(`Fatal error: ${err.message}`)
-  if (err.stack) log.error(err.stack)
+  console.error(`Fatal error: ${err.message}`)
+  if (err.stack) console.error(err.stack)
   process.exit(1)
 })

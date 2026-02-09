@@ -1,5 +1,4 @@
 import type { OpencodeClient, Event, Part } from "@opencode-ai/sdk"
-import { log } from "./log.js"
 
 export type LoopStatus = "complete" | "blocked" | "progress" | "unknown"
 
@@ -138,7 +137,7 @@ export async function subscribeToEvents(
       }
     } catch (err: any) {
       if (!abortController.signal.aborted) {
-        log.error(`Event stream error: ${err.message}`)
+        callbacks.onError("", `Event stream error: ${err.message}`)
       }
     }
   })()

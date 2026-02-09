@@ -18,6 +18,8 @@ export interface Config {
   attach?: string
   /** Max retries on error per iteration */
   maxRetries: number
+  /** Disable TUI, use plain log output */
+  noTui: boolean
 }
 
 function printUsage(): never {
@@ -37,6 +39,7 @@ Options:
   --port <n>              Port for opencode serve (default: 0 = auto)
   --attach <url>          Connect to existing opencode server (e.g. "http://localhost:4096")
   --max-retries <n>       Max retries on error per iteration (default: 3)
+  --no-tui                Disable TUI dashboard, use plain log output
   --help                  Show this help message
 
 Examples:
@@ -63,6 +66,7 @@ export function parseConfig(argv: string[]): Config {
   let port = 0
   let attach: string | undefined
   let maxRetries = 3
+  let noTui = false
   const positional: string[] = []
 
   for (let i = 0; i < args.length; i++) {
@@ -128,6 +132,9 @@ export function parseConfig(argv: string[]): Config {
           process.exit(1)
         }
         break
+      case "--no-tui":
+        noTui = true
+        break
       default:
         if (arg.startsWith("-")) {
           console.error(`Error: Unknown option '${arg}'`)
@@ -167,5 +174,6 @@ export function parseConfig(argv: string[]): Config {
     port,
     attach,
     maxRetries,
+    noTui,
   }
 }
