@@ -1,0 +1,15 @@
+{
+  "name": "opencode-loop",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.1.53"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.9"
+  }
+}
