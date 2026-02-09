@@ -117,6 +117,10 @@ export class LogUI implements LoopUI {
     return false
   }
 
+  waitForExit(): Promise<void> {
+    return Promise.resolve()
+  }
+
   destroy(): void {
     // no-op for plain log mode
   }

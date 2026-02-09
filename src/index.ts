@@ -1,64 +1,80 @@
 import { createOpencode, createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk"
-import { cpSync, existsSync, rmSync } from "fs"
-import { join, resolve, dirname } from "path"
+import { resolve, dirname } from "path"
 import { parseConfig, type Config } from "./config.js"
 import {
   subscribeToEvents,
   getLatestAssistantParts,
   extractLoopControl,
+  type LoopControlResult,
 } from "./events.js"
 import type { LoopUI, IterationSummary } from "./ui.js"
 import { LogUI } from "./log-ui.js"
 import { TuiUI } from "./tui.js"
 
-// ─── .opencode file installation ──────────────────────────────────────
+// ─── Agent & MCP configuration ────────────────────────────────────────
 
-const OPENCODE_FILES = ["agents/loop.md", "plugins/loop.ts", "tools/loop-control.ts"]
+const LOOP_AGENT_PROMPT = `You are an autonomous coding agent running inside an iterative loop. The orchestrator will keep re-prompting you until you signal that your work is complete.
 
-/** The directory where this package's .opencode files live */
-function getSourceOpencodeDir(): string {
-  // Resolve relative to this file's location → project root / .opencode
-  return resolve(dirname(import.meta.dir), ".opencode")
+**CRITICAL: You MUST call the \`loop_control\` tool at the end of every single turn. Your turn is NOT considered finished until you call \`loop_control\`. If you do not call it, the orchestrator will assume you forgot and will re-prompt you, wasting time and resources. Text output alone does NOT end the loop.**
+
+## How the Loop Works
+
+1. You receive an initial prompt describing the work to be done.
+2. You work on the task using all available tools — editing files, running commands, searching code, etc.
+3. When you reach a natural stopping point, you MUST call the \`loop_control\` tool to signal your status:
+   - \`complete\` — All tasks are finished and verified. The loop will end.
+   - \`blocked\` — You cannot proceed due to an issue you can't resolve. The loop will end.
+   - \`progress\` — You've made progress but there's more to do. The loop will continue and you'll be re-prompted.
+4. If the orchestrator re-prompts you, continue where you left off. You have full context from previous iterations.
+
+## When to Use Each Status
+
+- **\`complete\`**: Use this when you have finished ALL the work requested. If there is nothing left to do, you MUST use \`complete\` — do not use \`progress\` when no work remains. Examples: you finished implementing a feature, you fixed the bug and tests pass, you answered the user's question fully.
+- **\`progress\`**: Use this ONLY when there is clearly more work remaining that you intend to do in the next iteration. Examples: you finished step 1 of 3, you need to run tests after making changes but hit a tool limit.
+- **\`blocked\`**: Use this only when you truly cannot proceed — e.g., missing credentials, ambiguous requirements that need human input, or a dependency that's broken in a way you can't fix.
+
+## Rules
+
+- **Always call \`loop_control\`** as the LAST action of each turn. This is mandatory, not optional. The \`loop_control\` tool call must be the final tool you invoke before your turn ends.
+- **Be thorough.** Don't signal \`complete\` until you have verified your work (e.g., ran tests, checked for errors, confirmed the build passes).
+- **Don't use \`progress\` when you're actually done.** If all tasks are complete, signal \`complete\`. Using \`progress\` when there's nothing left to do wastes an entire loop iteration.
+- **Don't repeat work.** If you've already done something in a previous iteration, don't do it again unless there's a reason to.
+- **Be concise** in your \`loop_control\` messages. The orchestrator logs them for the user.
+
+## REMINDER: You MUST call \`loop_control\` before your turn ends. This is the ONLY way to properly signal the orchestrator. Do not end your turn without calling it.`
+
+/** Path to the bundled MCP server script */
+function getMcpServerPath(): string {
+  return resolve(dirname(import.meta.dir), "src", "mcp-server.ts")
 }
 
-/**
- * Copy our .opencode agent/plugin/tool files into the target project.
- * Overwrites existing files with a warning.
- */
-function installOpencodeFiles(targetCwd: string, ui: LoopUI) {
-  const sourceDir = getSourceOpencodeDir()
-  const targetDir = join(targetCwd, ".opencode")
-
-  for (const file of OPENCODE_FILES) {
-    const src = join(sourceDir, file)
-    const dest = join(targetDir, file)
-
-    if (!existsSync(src)) {
-      ui.onWarn(`Source file not found: ${src}`)
-      continue
-    }
-
-    if (existsSync(dest)) {
-      ui.onInfo(`Overwriting ${file} in target .opencode/`)
-    }
-
-    cpSync(src, dest, { recursive: true })
+/** Build the config object for createOpencode with agent + MCP server defined inline */
+function buildOpencodeConfig(config: Config): Record<string, any> {
+  const agentConfig: Record<string, any> = {
+    description: "Autonomous loop agent for iterative task completion",
+    prompt: LOOP_AGENT_PROMPT,
+    permission: {
+      "*": "allow",
+    },
+    tools: { "*": true },
   }
 
-  ui.onSuccess("Installed loop agent, plugin, and tool into target project")
-}
+  if (config.model) {
+    agentConfig.model = `${config.model.providerID}/${config.model.modelID}`
+  }
 
-/**
- * Clean up installed .opencode files from the target project.
- */
-function cleanupOpencodeFiles(targetCwd: string) {
-  const targetDir = join(targetCwd, ".opencode")
-
-  for (const file of OPENCODE_FILES) {
-    const dest = join(targetDir, file)
-    if (existsSync(dest)) {
-      rmSync(dest)
-    }
+  return {
+    agent: {
+      [config.agent]: agentConfig,
+    },
+    mcp: {
+      loop: {
+        type: "local",
+        command: ["bun", getMcpServerPath()],
+        enabled: true,
+        timeout: 10000,
+      },
+    },
   }
 }
 
@@ -74,9 +90,6 @@ async function run() {
     ? `${config.model.providerID}/${config.model.modelID}`
     : undefined
 
-  // Install .opencode files into target project
-  installOpencodeFiles(config.cwd, ui)
-
   let client: OpencodeClient
   let serverClose: (() => void) | undefined
   let serverUrl: string | undefined
@@ -91,8 +104,10 @@ async function run() {
       ui.onInfo("Starting opencode server...")
       // Change to target directory so opencode serves the correct project
       process.chdir(config.cwd)
+      const opencodeConfig = buildOpencodeConfig(config)
       const result = await createOpencode({
         port: config.port || undefined,
+        config: opencodeConfig as any,
       })
       client = result.client
       serverClose = result.server.close
@@ -116,11 +131,11 @@ async function run() {
     // Run the loop
     await loopMain(client, sessionID, config, ui)
   } finally {
-    cleanupOpencodeFiles(config.cwd)
     if (serverClose) {
       ui.onInfo("Shutting down server...")
       serverClose()
     }
+    await ui.waitForExit()
     ui.destroy()
   }
 }
@@ -153,6 +168,7 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
   const eventState = {
     idleResolve: null as ((value: void) => void) | null,
     errorResolve: null as ((value: any) => void) | null,
+    latestLoopControl: null as import("./events.js").LoopControlResult | null,
   }
 
   const eventSub = await subscribeToEvents(client, sessionID, {
@@ -181,6 +197,9 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
     onStatus: (_sid, status) => {
       ui.onStatusChange(status)
     },
+    onLoopControl: (result) => {
+      eventState.latestLoopControl = result
+    },
   })
 
   try {
@@ -194,6 +213,9 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
     // Main loop
     while (currentIteration <= config.maxIterations && !aborted) {
       const iterStart = Date.now()
+
+      // Reset SSE-captured loop_control for this iteration
+      eventState.latestLoopControl = null
 
       // Wait for session to go idle or error
       const result = await waitForIdleOrError(eventState, config.maxRetries, ui, async (retryNum) => {
@@ -209,9 +231,15 @@ async function loopMain(client: OpencodeClient, sessionID: string, config: Confi
       }
 
       // Session is idle — check what happened
-      const assistantData = await getLatestAssistantParts(client, sessionID)
+      // Prefer SSE-captured loop_control (real-time, no race condition)
+      // Fall back to REST API fetch if SSE missed it
+      const assistantData = await getLatestAssistantParts(client, sessionID, true)
       const iterDuration = Date.now() - iterStart
-      const loopResult = assistantData ? extractLoopControl(assistantData.parts) : null
+
+      let loopResult: LoopControlResult | null = eventState.latestLoopControl
+      if (!loopResult && assistantData) {
+        loopResult = extractLoopControl(assistantData.parts, true)
+      }
 
       const summary: IterationSummary = {
         iteration: currentIteration,

@@ -50,6 +50,9 @@ export interface LoopUI {
   /** Whether the loop is paused (TUI only — always false for log mode) */
   isPaused(): boolean
 
+  /** Wait for the user to acknowledge completion before exiting (TUI: "press any key", log: no-op) */
+  waitForExit(): Promise<void>
+
   /** Clean up resources (renderer, timers, etc.) */
   destroy(): void
 }

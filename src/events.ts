@@ -9,13 +9,30 @@ export interface LoopControlResult {
 
 /**
  * Extract loop_control tool call result from message parts.
- * Looks for the last ToolPart with tool === "loop_control" that has completed.
+ * Looks for the last ToolPart with a tool name ending in "loop_control" that has completed.
+ * Uses endsWith to handle both native tool names and MCP-prefixed names
+ * (e.g. "loop_control", "loop_loop_control").
  */
-export function extractLoopControl(parts: Part[]): LoopControlResult | null {
+export function extractLoopControl(parts: Part[], debug = false): LoopControlResult | null {
+  if (debug) {
+    console.error(`[DEBUG extractLoopControl] parts.length=${parts.length}`)
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i]
+      if (p.type === "tool") {
+        console.error(`[DEBUG extractLoopControl]   part[${i}] type=tool tool=${p.tool} state.status=${p.state?.status}`)
+      } else {
+        console.error(`[DEBUG extractLoopControl]   part[${i}] type=${p.type}`)
+      }
+    }
+  }
+
   // Iterate in reverse to find the most recent loop_control call
   for (let i = parts.length - 1; i >= 0; i--) {
     const part = parts[i]
-    if (part.type === "tool" && part.tool === "loop_control") {
+    if (part.type === "tool" && part.tool.endsWith("loop_control")) {
+      if (debug) {
+        console.error(`[DEBUG extractLoopControl] Found loop_control at part[${i}], state=${JSON.stringify(part.state)}`)
+      }
       if (part.state.status === "completed") {
         const input = part.state.input as { status?: string; message?: string }
         return {
@@ -31,6 +48,9 @@ export function extractLoopControl(parts: Part[]): LoopControlResult | null {
       }
     }
   }
+  if (debug) {
+    console.error(`[DEBUG extractLoopControl] No loop_control found, returning null`)
+  }
   return null
 }
 
@@ -39,18 +59,37 @@ export function extractLoopControl(parts: Part[]): LoopControlResult | null {
  */
 export async function getLatestAssistantParts(
   client: OpencodeClient,
-  sessionID: string
+  sessionID: string,
+  debug = false
 ): Promise<{ parts: Part[]; cost: number; tokens: { input: number; output: number } } | null> {
   const result = await client.session.messages({
     path: { id: sessionID },
   })
-  if (result.error || !result.data) return null
+  if (result.error || !result.data) {
+    if (debug) {
+      console.error(`[DEBUG getLatestAssistantParts] error=${JSON.stringify(result.error)}, data=${result.data}`)
+    }
+    return null
+  }
 
   // Find the last assistant message
   const messages = result.data
+  if (debug) {
+    console.error(`[DEBUG getLatestAssistantParts] total messages=${messages.length}`)
+    // Log last few messages with roles
+    const start = Math.max(0, messages.length - 5)
+    for (let i = start; i < messages.length; i++) {
+      const msg = messages[i]
+      console.error(`[DEBUG getLatestAssistantParts]   msg[${i}] role=${msg.info.role} id=${msg.info.id} parts=${msg.parts.length}`)
+    }
+  }
+
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.info.role === "assistant") {
+      if (debug) {
+        console.error(`[DEBUG getLatestAssistantParts] Using assistant msg[${i}] id=${msg.info.id} with ${msg.parts.length} parts`)
+      }
       return {
         parts: msg.parts,
         cost: msg.info.cost,
@@ -61,6 +100,9 @@ export async function getLatestAssistantParts(
       }
     }
   }
+  if (debug) {
+    console.error(`[DEBUG getLatestAssistantParts] No assistant message found!`)
+  }
   return null
 }
 
@@ -70,6 +112,7 @@ export interface EventLoopCallbacks {
   onToolUpdate: (tool: string, status: string, title?: string) => void
   onTextDelta: (text: string) => void
   onStatus: (sessionID: string, status: string) => void
+  onLoopControl: (result: LoopControlResult) => void
 }
 
 /**
@@ -130,6 +173,20 @@ export async function subscribeToEvents(
                   ? part.state.title
                   : undefined
               callbacks.onToolUpdate(part.tool, part.state.status, title ?? undefined)
+
+              // Detect loop_control completion directly from SSE stream
+              if (part.tool.endsWith("loop_control") && part.state.status === "completed") {
+                const input = part.state.input as { status?: string; message?: string }
+                callbacks.onLoopControl({
+                  status: (input.status as LoopStatus) ?? "unknown",
+                  message: input.message ?? "",
+                })
+              } else if (part.tool.endsWith("loop_control") && part.state.status === "error") {
+                callbacks.onLoopControl({
+                  status: "unknown",
+                  message: `loop_control tool errored: ${(part.state as any).error}`,
+                })
+              }
             }
             break
           }

@@ -9,7 +9,6 @@ import {
   bold,
   dim,
   fg,
-  bg,
   type StyledText,
 } from "@opentui/core"
 import {
@@ -22,21 +21,15 @@ import {
 } from "./ui.js"
 
 // ─── Color palette ────────────────────────────────────────────────────
+// Monochrome base + 3 semantic colors only
 
 const COLORS = {
-  bg: "#1a1a2e",
-  headerBg: "#16213e",
-  panelBg: "#0f3460",
-  border: "#444466",
-  focusBorder: "#7c83ff",
-  text: "#e0e0e0",
-  textDim: "#888899",
+  border: "#666666",
+  focusBorder: "#ffffff",
+  dimText: "#888888",
   green: "#4ade80",
   yellow: "#facc15",
   red: "#f87171",
-  cyan: "#22d3ee",
-  blue: "#60a5fa",
-  magenta: "#c084fc",
 } as const
 
 // ─── Activity entry ───────────────────────────────────────────────────
@@ -104,13 +97,12 @@ export class TuiUI implements LoopUI {
   private buildLayout() {
     const r = this.renderer
 
-    // Root container
+    // Root container — no background color, respects terminal theme
     this.root = new BoxRenderable(r, {
       id: "root",
       width: "100%" as any,
       height: "100%" as any,
       flexDirection: "column",
-      backgroundColor: COLORS.bg,
     })
     r.root.add(this.root)
 
@@ -198,6 +190,13 @@ export class TuiUI implements LoopUI {
 
   private setupKeyboard() {
     this.renderer.keyInput.on("keypress", (key: KeyEvent) => {
+      // If waiting for exit, any key resolves
+      if (this.exitResolve) {
+        this.exitResolve()
+        this.exitResolve = null
+        return
+      }
+
       if (key.name === "q" && !key.ctrl && !key.meta) {
         // Graceful quit — the orchestrator catches SIGINT
         process.kill(process.pid, "SIGINT")
@@ -250,23 +249,23 @@ export class TuiUI implements LoopUI {
     const elapsed = formatDuration(Date.now() - this.startTime)
     const iterLabel = this.maxIter > 0 ? `Iter ${this.iteration}/${this.maxIter}` : "..."
     const statusDot = this.status === "busy"
-      ? fg(COLORS.yellow)("●")
+      ? fg(COLORS.yellow)("\u25CF")
       : this.status === "idle"
-        ? fg(COLORS.green)("●")
-        : fg(COLORS.red)("●")
+        ? fg(COLORS.green)("\u25CF")
+        : fg(COLORS.red)("\u25CF")
     const pauseLabel = this._paused ? fg(COLORS.yellow)(" PAUSED") : ""
 
-    this.headerTitle.content = t`  ${bold(fg(COLORS.cyan)(iterLabel))}  ${statusDot} ${this.status}${pauseLabel}  ${dim(elapsed)}`
+    this.headerTitle.content = t`  ${bold(iterLabel)}  ${statusDot} ${this.status}${pauseLabel}  ${dim(elapsed)}`
 
     const promptTrunc = this.prompt.length > 60 ? this.prompt.slice(0, 57) + "..." : this.prompt
-    this.headerStats.content = t`  ${dim("Prompt:")} ${promptTrunc}  ${dim("Cost:")} ${fg(COLORS.green)(formatCost(this.totalCost))}  ${dim("Tokens:")} ${formatTokens(this.totalTokensIn)} in / ${formatTokens(this.totalTokensOut)} out`
+    this.headerStats.content = t`  ${dim("Prompt:")} ${promptTrunc}  ${dim("Cost:")} ${formatCost(this.totalCost)}  ${dim("Tokens:")} ${formatTokens(this.totalTokensIn)} in / ${formatTokens(this.totalTokensOut)} out`
   }
 
   // ─── Footer builder ───────────────────────────────────────────────
 
   private buildFooter(): StyledText {
     const pauseLabel = this._paused ? "unpause" : "pause"
-    return t` ${dim("q")} quit  ${dim("p")} ${pauseLabel}  ${dim("↑↓")} scroll  ${dim("tab")} switch panel`
+    return t` ${dim("q")} quit  ${dim("p")} ${pauseLabel}  ${dim("\u2191\u2193")} scroll  ${dim("tab")} switch panel`
   }
 
   // ─── LoopUI implementation ────────────────────────────────────────
@@ -358,6 +357,16 @@ export class TuiUI implements LoopUI {
     })
   }
 
+  /** Wait for user to press any key before exiting. Updates footer and blocks until keypress. */
+  waitForExit(): Promise<void> {
+    this.footerText.content = t` ${dim("Press any key to exit...")}`
+    return new Promise<void>((resolve) => {
+      this.exitResolve = resolve
+    })
+  }
+
+  private exitResolve: (() => void) | null = null
+
   destroy(): void {
     if (this.timerInterval) {
       clearInterval(this.timerInterval)
@@ -382,12 +391,11 @@ export class TuiUI implements LoopUI {
       this.activities.shift()
     }
 
-    // Build styled line
+    // Build styled line — tool label is plain, title is dim
     const icon = this.activityIcon(status)
-    const toolLabel = fg(COLORS.blue)(tool)
     const titleText = title ? dim(` ${title}`) : ""
     const line = new TextRenderable(this.renderer, {
-      content: t`  ${icon} ${toolLabel}${titleText}`,
+      content: t`  ${icon} ${tool}${titleText}`,
       height: 1,
       truncate: true,
       flexShrink: 0,
@@ -409,22 +417,22 @@ export class TuiUI implements LoopUI {
       case "completed":
       case "complete":
       case "success":
-        return fg(COLORS.green)("✓") as any
+        return fg(COLORS.green)("\u2713") as any
       case "running":
-        return fg(COLORS.yellow)("●") as any
+        return fg(COLORS.yellow)("\u25CF") as any
       case "error":
       case "blocked":
-        return fg(COLORS.red)("✗") as any
+        return fg(COLORS.red)("\u2717") as any
       case "pending":
-        return fg(COLORS.textDim)("○") as any
+        return dim("\u25CB") as any
       case "warning":
         return fg(COLORS.yellow)("!") as any
       case "info":
       case "config":
       case "started":
-        return fg(COLORS.cyan)("·") as any
+        return dim("\u00B7") as any
       default:
-        return fg(COLORS.textDim)("•") as any
+        return dim("\u2022") as any
     }
   }
 
@@ -434,7 +442,6 @@ export class TuiUI implements LoopUI {
     const icon = status ? statusIcon(status.status) : "?"
     const iconColor = status?.status === "complete" ? COLORS.green
       : status?.status === "blocked" ? COLORS.red
-      : status?.status === "progress" ? COLORS.cyan
       : COLORS.yellow
 
     const msg = status?.message
@@ -453,7 +460,7 @@ export class TuiUI implements LoopUI {
   }
 
   private printPlainSummary(summaries: IterationSummary[], totalCost: number) {
-    console.log("\n── Loop Summary ──────────────────────────────────────")
+    console.log("\n\u2500\u2500 Loop Summary \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
 
     if (summaries.length === 0) {
       console.log("No iterations completed.")
@@ -471,7 +478,7 @@ export class TuiUI implements LoopUI {
     const totalTokensIn = summaries.reduce((a, s) => a + s.tokens.input, 0)
     const totalTokensOut = summaries.reduce((a, s) => a + s.tokens.output, 0)
 
-    console.log("─────────────────────────────────────────────────────")
+    console.log("\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
     console.log(`Total iterations: ${summaries.length}`)
     console.log(`Total time: ${formatDuration(totalDuration)}`)
     console.log(`Total cost: ${formatCost(totalCost)}`)

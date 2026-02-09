@@ -5,10 +5,6 @@ const COLORS = {
   red: "\x1b[31m",
   green: "\x1b[32m",
   yellow: "\x1b[33m",
-  blue: "\x1b[34m",
-  magenta: "\x1b[35m",
-  cyan: "\x1b[36m",
-  gray: "\x1b[90m",
 } as const
 
 function timestamp(): string {
@@ -30,7 +26,7 @@ export class Logger {
 
   private prefix(): string {
     if (this.iteration > 0) {
-      return `${timestamp()} ${COLORS.cyan}[${this.iteration}/${this.maxIterations}]${COLORS.reset}`
+      return `${timestamp()} ${COLORS.bold}[${this.iteration}/${this.maxIterations}]${COLORS.reset}`
     }
     return timestamp()
   }
@@ -52,15 +48,15 @@ export class Logger {
   }
 
   status(msg: string) {
-    console.log(`${this.prefix()} ${COLORS.magenta}${msg}${COLORS.reset}`)
+    console.log(`${this.prefix()} ${COLORS.bold}${msg}${COLORS.reset}`)
   }
 
   tool(name: string, status: string) {
-    console.log(`${this.prefix()} ${COLORS.blue}[tool]${COLORS.reset} ${name} ${COLORS.dim}${status}${COLORS.reset}`)
+    console.log(`${this.prefix()} ${COLORS.dim}[tool]${COLORS.reset} ${name} ${COLORS.dim}${status}${COLORS.reset}`)
   }
 
   text(msg: string) {
-    console.log(`${this.prefix()} ${COLORS.gray}${msg}${COLORS.reset}`)
+    console.log(`${this.prefix()} ${COLORS.dim}${msg}${COLORS.reset}`)
   }
 
   separator() {
@@ -69,7 +65,7 @@ export class Logger {
 
   banner(title: string) {
     this.separator()
-    console.log(`${COLORS.bold}${COLORS.cyan}  ${title}${COLORS.reset}`)
+    console.log(`${COLORS.bold}  ${title}${COLORS.reset}`)
     this.separator()
   }
 }
